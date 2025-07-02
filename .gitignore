@@ -1,6 +1,8 @@
 # CARLA Simulator Files
 Carla-*-Win64-Shipping/
-CARLA_*
+CARLA_*-Win64-Shipping/
+**/CarlaUnreal.exe
+**/CarlaUnreal/
 
 # Python
 __pycache__/

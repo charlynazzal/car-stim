@@ -1,6 +1,6 @@
 import cv2
 import carla
-from src.carla_connector import CarlaConnector
+from carla_connector import CarlaConnector
 import sys
 
 def main_loop(connector):
