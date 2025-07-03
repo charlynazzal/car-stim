@@ -34,7 +34,7 @@ class CarlaConnector:
             print(f"Error connecting to CARLA: {e}")
             raise
 
-    def spawn_vehicle(self, blueprint_name='vehicle.tesla.model3', spawn_point=None):
+    def spawn_vehicle(self, blueprint_name='vehicle.lincoln.mkz', spawn_point=None):
         """
         Spawns a vehicle in the world.
 
@@ -58,9 +58,14 @@ class CarlaConnector:
         print(f"Spawned vehicle: {self.vehicle.type_id}")
         return self.vehicle
 
-    def setup_camera(self, attach_to, width=800, height=600, fov=90):
+    def setup_camera(self, attach_to, width=640, height=480, fov=110):
         """
         Creates and attaches an RGB camera sensor to an actor.
+        
+        Optimized settings for lane detection:
+        - Lower resolution (640x480) for better performance
+        - Wider FOV (110°) to see more of the road
+        - Positioned for optimal lane visibility
 
         Args:
             attach_to (carla.Actor): The actor to attach the camera to.
@@ -76,7 +81,9 @@ class CarlaConnector:
         camera_bp.set_attribute('image_size_y', str(height))
         camera_bp.set_attribute('fov', str(fov))
 
-        camera_transform = carla.Transform(carla.Location(x=1.5, z=2.4))
+        # Optimized camera position for lane detection
+        # Lower height, forward position for better road view
+        camera_transform = carla.Transform(carla.Location(x=2.0, z=1.4))
         
         self.camera = self.world.spawn_actor(
             camera_bp, 

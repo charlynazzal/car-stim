@@ -8,20 +8,28 @@ def main_loop(connector):
     The main loop for processing and visualization.
     """
     vehicle = connector.vehicle
-    vehicle.set_autopilot(True)
+    # Disable autopilot - we'll implement our own lane-following control
+    vehicle.set_autopilot(False)
+    
+    # Keep vehicle stationary for now while we test camera feed
+    # Later we'll replace this with our lane-following control
+    vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
 
     spectator = connector.world.get_spectator()
 
     try:
         while True:
+            # Position spectator to follow the vehicle
             transform = carla.Transform(
                 vehicle.get_transform().transform(carla.Location(x=-5, z=2.5)),
                 vehicle.get_transform().rotation
             )
             spectator.set_transform(transform)
 
+            # Get camera image
             image = connector.image_queue.get()
 
+            # Display camera feed
             cv2.imshow("CARLA Camera", image)
 
             if cv2.waitKey(1) == ord('q'):
