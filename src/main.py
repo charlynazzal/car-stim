@@ -1,20 +1,23 @@
 import cv2
 import carla
 from carla_connector import CarlaConnector
+from lane_detection import LaneDetector
 import sys
 
 def main_loop(connector):
     """
-    The main loop for processing and visualization.
+    The main loop for processing and visualization with lane detection.
     """
     vehicle = connector.vehicle
     # Disable autopilot - we'll implement our own lane-following control
     vehicle.set_autopilot(False)
     
-    # Keep vehicle stationary for now while we test camera feed
-    # Later we'll replace this with our lane-following control
+    # Keep vehicle stationary for now while we test lane detection
     vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
 
+    # Initialize lane detector
+    lane_detector = LaneDetector()
+    
     spectator = connector.world.get_spectator()
 
     try:
@@ -29,11 +32,24 @@ def main_loop(connector):
             # Get camera image
             image = connector.image_queue.get()
 
-            # Display camera feed
-            cv2.imshow("CARLA Camera", image)
-
-            if cv2.waitKey(1) == ord('q'):
+            # Process image with lane detection
+            result_image, lane_info = lane_detector.process_image(image)
+            
+            # Display results
+            cv2.imshow("CARLA Camera - Lane Detection", result_image)
+            
+            # Optional: Show processing steps (press 'e' to toggle)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('e'):
+                cv2.imshow("Edges", lane_info['edges_image'])
+                cv2.imshow("Masked Edges", lane_info['masked_edges'])
+            elif key == ord('q'):
                 break
+                
+            # Print lane detection info
+            if lane_info['lines_detected'] > 0:
+                print(f"Lines detected: {lane_info['lines_detected']}")
+                
     finally:
         cv2.destroyAllWindows()
 
