@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+from collections import deque
 
 class LaneDetector:
     """
@@ -7,12 +8,12 @@ class LaneDetector:
     
     This class processes images from CARLA's camera sensor to:
     1. Find lane lines using edge detection
-    2. Calculate lane center position
-    3. Determine steering direction
+    2. Calculate lane center position with temporal smoothing
+    3. Determine steering direction with stability improvements
     """
     
     def __init__(self):
-        """Initialize the lane detector with default parameters."""
+        """Initialize the lane detector with default parameters and temporal filtering."""
         # Image dimensions (should match camera settings)
         self.image_width = 640
         self.image_height = 480
@@ -26,7 +27,22 @@ class LaneDetector:
             [self.image_width, self.image_height]      # Bottom right
         ], dtype=np.int32)
         
-        print("Lane detector initialized")
+        # Temporal filtering for stability
+        self.history_size = 10  # Number of frames to remember
+        self.lane_center_history = deque(maxlen=self.history_size)
+        self.left_lane_history = deque(maxlen=self.history_size)
+        self.right_lane_history = deque(maxlen=self.history_size)
+        
+        # Confidence tracking
+        self.min_confidence_lines = 3  # Minimum lines needed for confidence
+        self.outlier_threshold = 50    # Pixels - lines too far from expected position are outliers
+        
+        # Previous frame memory for validation
+        self.prev_left_lane_x = None
+        self.prev_right_lane_x = None
+        self.prev_lane_center_x = None
+        
+        print("Lane detector initialized with temporal filtering")
     
     def preprocess_image(self, image):
         """
@@ -115,14 +131,41 @@ class LaneDetector:
         
         return lines
     
+    def filter_outliers(self, lines, expected_position=None, side='unknown'):
+        """
+        Filter out lines that are too far from expected position.
+        
+        Args:
+            lines: List of lines to filter
+            expected_position: Expected X position (from previous frame)
+            side: 'left' or 'right' for debugging
+            
+        Returns:
+            filtered_lines: Lines that are close to expected position
+        """
+        if not lines or expected_position is None:
+            return lines
+            
+        filtered_lines = []
+        
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            line_center_x = (x1 + x2) / 2
+            
+            # Check if line is within reasonable distance from expected position
+            if abs(line_center_x - expected_position) <= self.outlier_threshold:
+                filtered_lines.append(line)
+        
+        return filtered_lines
+    
     def classify_lanes(self, lines):
         """
-        Classify detected lines into left and right lanes using slope analysis.
+        Classify detected lines into left and right lanes using slope analysis and outlier filtering.
         
-        Updated Method: Position-based classification with slope filtering
+        Updated Method: Position-based classification with slope filtering and outlier removal
         - Filter lines by reasonable slope range
+        - Remove outliers based on previous frame positions
         - Classify based on position relative to image center
-        - This works better for CARLA's camera perspective
         
         Args:
             lines: Array of detected lines from Hough transform
@@ -141,12 +184,10 @@ class LaneDetector:
         image_center_x = self.image_width // 2
         
         # Slope thresholds - adjusted for CARLA's perspective
-        min_slope_threshold = 0.05  # Minimum slope magnitude (capture very gentle slopes like -0.09)
-        max_slope_threshold = 2.0  # Maximum slope magnitude (filter very steep lines)
+        min_slope_threshold = 0.05  # Minimum slope magnitude
+        max_slope_threshold = 2.0   # Maximum slope magnitude
         
-        # Debug: Print first few slopes to understand what we're getting
-        debug_count = 0
-        
+        # First pass: basic classification by position and slope
         for line in lines:
             x1, y1, x2, y2 = line[0]
             
@@ -158,30 +199,170 @@ class LaneDetector:
             slope = (y2 - y1) / (x2 - x1)
             line_center_x = (x1 + x2) / 2
             
-            # Debug output for first few lines (commented out for cleaner output)
-            # if debug_count < 3:
-            #     side = "LEFT" if line_center_x < image_center_x else "RIGHT"
-            #     print(f"Debug - Line {debug_count}: slope={slope:.2f}, position={side}, center_x={line_center_x:.0f}")
-            #     debug_count += 1
-            
             # Filter out lines with slopes too close to horizontal or too steep
             if abs(slope) < min_slope_threshold or abs(slope) > max_slope_threshold:
                 continue
                 
-            # Simplified classification: primarily based on position
-            # This works better for CARLA's camera perspective
+            # Classify based on position
             if line_center_x < image_center_x:
-                # Left side of image = left lane
                 left_lanes.append(line)
             else:
-                # Right side of image = right lane  
                 right_lanes.append(line)
+        
+        # Second pass: filter outliers based on previous frame positions
+        left_lanes = self.filter_outliers(left_lanes, self.prev_left_lane_x, 'left')
+        right_lanes = self.filter_outliers(right_lanes, self.prev_right_lane_x, 'right')
                 
         return left_lanes, right_lanes
 
+    def calculate_stable_lane_position(self, lanes, history_deque, prev_position):
+        """
+        Calculate stable lane position using confidence-based filtering and temporal smoothing.
+        
+        Args:
+            lanes: List of lane lines
+            history_deque: Deque storing historical positions
+            prev_position: Previous frame position for validation
+            
+        Returns:
+            stable_position: Smoothed lane position, or None if not confident
+        """
+        if not lanes:
+            return None
+            
+        # Calculate current frame position
+        x_positions = []
+        for line in lanes:
+            x1, y1, x2, y2 = line[0]
+            # Use the bottom point (closer to vehicle) for more accurate steering
+            if y1 > y2:  # y1 is lower in image (closer to vehicle)
+                x_positions.append(x1)
+            else:  # y2 is lower in image
+                x_positions.append(x2)
+        
+        if not x_positions:
+            return None
+            
+        # Current frame average
+        current_position = sum(x_positions) / len(x_positions)
+        
+        # Add to history
+        history_deque.append(current_position)
+        
+        # Calculate smoothed position using weighted average
+        # More recent frames have higher weight
+        if len(history_deque) >= 3:  # Need at least 3 frames for stability
+            weights = np.linspace(0.1, 1.0, len(history_deque))  # Recent frames weighted higher
+            weighted_positions = np.array(history_deque) * weights
+            stable_position = np.sum(weighted_positions) / np.sum(weights)
+        else:
+            stable_position = current_position
+            
+        return stable_position
+
+    def calculate_lane_center(self, left_lanes, right_lanes):
+        """
+        Calculate the center point between left and right lanes with temporal smoothing.
+        
+        Enhanced Method: Stable Position Calculation with Temporal Filtering
+        1. Calculate stable positions for left and right lanes using history
+        2. Apply temporal smoothing to reduce fluctuations
+        3. Use confidence-based validation
+        4. Determine steering direction with hysteresis
+        
+        Args:
+            left_lanes: List of left lane lines
+            right_lanes: List of right lane lines
+            
+        Returns:
+            lane_center_info: Dictionary with center calculation results
+        """
+        # Image center (where vehicle should ideally be)
+        image_center_x = self.image_width // 2  # 320 for 640px width
+        
+        # Calculate stable lane positions
+        stable_left_x = self.calculate_stable_lane_position(
+            left_lanes, self.left_lane_history, self.prev_left_lane_x
+        )
+        stable_right_x = self.calculate_stable_lane_position(
+            right_lanes, self.right_lane_history, self.prev_right_lane_x
+        )
+        
+        # Initialize results
+        lane_center_info = {
+            'has_left_lane': stable_left_x is not None,
+            'has_right_lane': stable_right_x is not None,
+            'left_lane_x': stable_left_x,
+            'right_lane_x': stable_right_x,
+            'lane_center_x': None,
+            'steering_error': None,
+            'steering_direction': 'UNKNOWN',
+            'confidence': 'LOW'
+        }
+        
+        # Calculate lane center with confidence assessment
+        if stable_left_x is not None and stable_right_x is not None:
+            # Perfect case: both lanes detected
+            current_center = (stable_left_x + stable_right_x) / 2
+            lane_center_info['confidence'] = 'HIGH'
+            
+        elif stable_left_x is not None:
+            # Only left lane: estimate center based on typical lane width
+            estimated_lane_width = 200  # pixels
+            current_center = stable_left_x + (estimated_lane_width / 2)
+            lane_center_info['confidence'] = 'MEDIUM'
+            
+        elif stable_right_x is not None:
+            # Only right lane: estimate center based on typical lane width
+            estimated_lane_width = 200  # pixels
+            current_center = stable_right_x - (estimated_lane_width / 2)
+            lane_center_info['confidence'] = 'MEDIUM'
+        else:
+            # No lanes detected - use previous center if available
+            if self.prev_lane_center_x is not None:
+                current_center = self.prev_lane_center_x
+                lane_center_info['confidence'] = 'LOW'
+            else:
+                current_center = None
+                lane_center_info['confidence'] = 'NONE'
+        
+        # Apply temporal smoothing to lane center
+        if current_center is not None:
+            self.lane_center_history.append(current_center)
+            
+            # Smooth lane center using weighted average
+            if len(self.lane_center_history) >= 3:
+                weights = np.linspace(0.1, 1.0, len(self.lane_center_history))
+                weighted_centers = np.array(self.lane_center_history) * weights
+                lane_center_info['lane_center_x'] = np.sum(weighted_centers) / np.sum(weights)
+            else:
+                lane_center_info['lane_center_x'] = current_center
+        
+        # Calculate steering error and direction with hysteresis
+        if lane_center_info['lane_center_x'] is not None:
+            # Steering error: how far off-center we are
+            lane_center_info['steering_error'] = lane_center_info['lane_center_x'] - image_center_x
+            
+            # Determine steering direction with hysteresis (larger dead zone for stability)
+            dead_zone = 15 if lane_center_info['confidence'] == 'HIGH' else 25
+            
+            if abs(lane_center_info['steering_error']) < dead_zone:
+                lane_center_info['steering_direction'] = 'STRAIGHT'
+            elif lane_center_info['steering_error'] > 0:
+                lane_center_info['steering_direction'] = 'STEER_LEFT'
+            else:
+                lane_center_info['steering_direction'] = 'STEER_RIGHT'
+        
+        # Update previous frame memory
+        self.prev_left_lane_x = stable_left_x
+        self.prev_right_lane_x = stable_right_x
+        self.prev_lane_center_x = lane_center_info['lane_center_x']
+        
+        return lane_center_info
+
     def process_image(self, image):
         """
-        Complete lane detection pipeline with lane classification.
+        Complete lane detection pipeline with lane classification and center calculation.
         
         Args:
             image: Raw camera image from CARLA
@@ -199,13 +380,16 @@ class LaneDetector:
         # Step 3: Detect lines
         lines = self.detect_lines(masked_edges)
         
-        # Step 4: Classify lanes (NEW!)
+        # Step 4: Classify lanes
         left_lanes, right_lanes = self.classify_lanes(lines)
         
-        # Step 5: Create result image (copy of original)
+        # Step 5: Calculate lane center (NEW!)
+        lane_center_info = self.calculate_lane_center(left_lanes, right_lanes)
+        
+        # Step 6: Create result image (copy of original)
         result_image = image.copy()
         
-        # Step 6: Draw classified lanes with different colors
+        # Step 7: Draw classified lanes with different colors
         # Left lanes in RED
         for line in left_lanes:
             x1, y1, x2, y2 = line[0]
@@ -216,16 +400,30 @@ class LaneDetector:
             x1, y1, x2, y2 = line[0]
             cv2.line(result_image, (x1, y1), (x2, y2), (255, 0, 0), 3)
         
-        # Step 7: Draw ROI on result image
+        # Step 8: Draw lane center visualization (NEW!)
+        if lane_center_info['lane_center_x'] is not None:
+            center_x = int(lane_center_info['lane_center_x'])
+            # Draw vertical line showing calculated lane center
+            cv2.line(result_image, (center_x, 0), (center_x, self.image_height), (0, 255, 255), 2)
+            
+            # Draw circle at bottom showing lane center point
+            cv2.circle(result_image, (center_x, self.image_height - 50), 10, (0, 255, 255), -1)
+        
+        # Step 9: Draw vehicle center reference
+        image_center_x = self.image_width // 2
+        cv2.line(result_image, (image_center_x, 0), (image_center_x, self.image_height), (255, 255, 255), 1)
+        
+        # Step 10: Draw ROI on result image
         cv2.polylines(result_image, [self.roi_vertices], True, (255, 255, 0), 2)
         
-        # Step 8: Prepare enhanced lane info
+        # Step 11: Prepare enhanced lane info
         lane_info = {
             'total_lines': len(lines) if lines is not None else 0,
             'left_lanes': len(left_lanes),
             'right_lanes': len(right_lanes),
             'edges_image': edges,
-            'masked_edges': masked_edges
+            'masked_edges': masked_edges,
+            'lane_center': lane_center_info  # NEW!
         }
         
         return result_image, lane_info 
