@@ -115,9 +115,73 @@ class LaneDetector:
         
         return lines
     
+    def classify_lanes(self, lines):
+        """
+        Classify detected lines into left and right lanes using slope analysis.
+        
+        Updated Method: Position-based classification with slope filtering
+        - Filter lines by reasonable slope range
+        - Classify based on position relative to image center
+        - This works better for CARLA's camera perspective
+        
+        Args:
+            lines: Array of detected lines from Hough transform
+            
+        Returns:
+            left_lanes: List of lines classified as left lane
+            right_lanes: List of lines classified as right lane
+        """
+        if lines is None:
+            return [], []
+            
+        left_lanes = []
+        right_lanes = []
+        
+        # Image center for position analysis
+        image_center_x = self.image_width // 2
+        
+        # Slope thresholds - adjusted for CARLA's perspective
+        min_slope_threshold = 0.05  # Minimum slope magnitude (capture very gentle slopes like -0.09)
+        max_slope_threshold = 2.0  # Maximum slope magnitude (filter very steep lines)
+        
+        # Debug: Print first few slopes to understand what we're getting
+        debug_count = 0
+        
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            
+            # Calculate slope: rise over run
+            # Handle vertical lines (divide by zero)
+            if x2 - x1 == 0:
+                continue  # Skip vertical lines
+                
+            slope = (y2 - y1) / (x2 - x1)
+            line_center_x = (x1 + x2) / 2
+            
+            # Debug output for first few lines (commented out for cleaner output)
+            # if debug_count < 3:
+            #     side = "LEFT" if line_center_x < image_center_x else "RIGHT"
+            #     print(f"Debug - Line {debug_count}: slope={slope:.2f}, position={side}, center_x={line_center_x:.0f}")
+            #     debug_count += 1
+            
+            # Filter out lines with slopes too close to horizontal or too steep
+            if abs(slope) < min_slope_threshold or abs(slope) > max_slope_threshold:
+                continue
+                
+            # Simplified classification: primarily based on position
+            # This works better for CARLA's camera perspective
+            if line_center_x < image_center_x:
+                # Left side of image = left lane
+                left_lanes.append(line)
+            else:
+                # Right side of image = right lane  
+                right_lanes.append(line)
+                
+        return left_lanes, right_lanes
+
     def process_image(self, image):
         """
-        Complete lane detection pipeline.
+        Complete lane detection pipeline with lane classification.
         
         Args:
             image: Raw camera image from CARLA
@@ -135,21 +199,31 @@ class LaneDetector:
         # Step 3: Detect lines
         lines = self.detect_lines(masked_edges)
         
-        # Step 4: Create result image (copy of original)
+        # Step 4: Classify lanes (NEW!)
+        left_lanes, right_lanes = self.classify_lanes(lines)
+        
+        # Step 5: Create result image (copy of original)
         result_image = image.copy()
         
-        # Step 5: Draw detected lines on result image
-        if lines is not None:
-            for line in lines:
-                x1, y1, x2, y2 = line[0]
-                cv2.line(result_image, (x1, y1), (x2, y2), (0, 255, 0), 3)
+        # Step 6: Draw classified lanes with different colors
+        # Left lanes in RED
+        for line in left_lanes:
+            x1, y1, x2, y2 = line[0]
+            cv2.line(result_image, (x1, y1), (x2, y2), (0, 0, 255), 3)
+            
+        # Right lanes in BLUE
+        for line in right_lanes:
+            x1, y1, x2, y2 = line[0]
+            cv2.line(result_image, (x1, y1), (x2, y2), (255, 0, 0), 3)
         
-        # Step 6: Draw ROI on result image
-        cv2.polylines(result_image, [self.roi_vertices], True, (255, 0, 0), 2)
+        # Step 7: Draw ROI on result image
+        cv2.polylines(result_image, [self.roi_vertices], True, (255, 255, 0), 2)
         
-        # Prepare lane info (we'll expand this later)
+        # Step 8: Prepare enhanced lane info
         lane_info = {
-            'lines_detected': len(lines) if lines is not None else 0,
+            'total_lines': len(lines) if lines is not None else 0,
+            'left_lanes': len(left_lanes),
+            'right_lanes': len(right_lanes),
             'edges_image': edges,
             'masked_edges': masked_edges
         }

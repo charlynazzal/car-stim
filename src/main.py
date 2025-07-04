@@ -46,9 +46,9 @@ def main_loop(connector):
             elif key == ord('q'):
                 break
                 
-            # Print lane detection info
-            if lane_info['lines_detected'] > 0:
-                print(f"Lines detected: {lane_info['lines_detected']}")
+            # Print enhanced lane detection info
+            if lane_info['total_lines'] > 0:
+                print(f"Total: {lane_info['total_lines']} | Left: {lane_info['left_lanes']} | Right: {lane_info['right_lanes']}")
                 
     finally:
         cv2.destroyAllWindows()
