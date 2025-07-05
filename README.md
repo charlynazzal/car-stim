@@ -19,8 +19,8 @@ A Python-based autonomous lane following system using the CARLA simulator.
 ## Setup
 
 1. **Clone the repository**:
-   ```bash
-   git clone <your-repo-url>
+   ```bash[
+   git clone https://github.com/charlynazzal/car-stim
    cd autonomous-driving
    ```
 
