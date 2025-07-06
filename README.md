@@ -76,4 +76,4 @@ The system is designed to work independently of where CARLA is installed. Your P
 
 ## Status
 
-This is a work in progress. The system currently has basic lane detection and vehicle control implemented, but requires further development and testing for reliable operation. 
+This is a work in progress. The system currently has basic lane detection and vehicle control implemented, but requires further development and testing for reliable operation.
