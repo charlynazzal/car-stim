@@ -1,466 +1,509 @@
 import cv2
 import numpy as np
+import torch
+import torch.nn.functional as F
+from ultralytics import YOLO
+import segmentation_models_pytorch as smp
 from collections import deque
+import time
+import logging
 
-class LaneDetector:
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class ModernLaneDetector:
     """
-    Robust lane detection system for autonomous driving.
-    
-    This system implements a multi-stage approach:
-    1. Road segmentation to identify drivable areas
-    2. Lane detection within road boundaries only
-    3. Path planning within detected lanes
-    4. Basic obstacle awareness
+    Modern lane detection system using:
+    1. YOLOv8 for object detection (vehicles, pedestrians, traffic signs)
+    2. Semantic segmentation for precise lane detection
+    3. Advanced computer vision techniques used in current research
     """
     
     def __init__(self):
-        """Initialize the robust lane detector."""
+        """Initialize the modern lane detection system."""
         # Image dimensions
         self.image_width = 640
         self.image_height = 480
         
-        # Define a more focused ROI that covers the road ahead
-        self.roi_vertices = np.array([
-            [0, self.image_height - 80],                    # Bottom left
-            [self.image_width // 2 - 150, self.image_height // 2 + 20],  # Top left
-            [self.image_width // 2 + 150, self.image_height // 2 + 20],  # Top right  
-            [self.image_width - 1, self.image_height - 80]  # Bottom right
-        ], dtype=np.int32)
+        # Initialize YOLOv8 for object detection
+        self.yolo_model = None
+        self.segmentation_model = None
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # Temporal filtering
-        self.history_size = 10
-        self.lane_center_history = deque(maxlen=self.history_size)
-        self.road_mask_history = deque(maxlen=5)  # For road segmentation stability
+        # Load models
+        self._load_models()
+        
+        # Detection classes for autonomous driving
+        self.vehicle_classes = [2, 3, 5, 7]  # car, motorcycle, bus, truck
+        self.person_classes = [0]  # person
+        self.traffic_classes = [9, 10, 11, 12, 13]  # traffic light, stop sign, etc.
         
         # Lane detection parameters
-        self.min_lane_width = 80   # Minimum pixels between lane lines
-        self.max_lane_width = 200  # Maximum pixels between lane lines
-        self.outlier_threshold = 40  # Reduced for more stable detection
+        self.lane_colors = {
+            'ego_lane': [255, 255, 255],      # White lanes
+            'adjacent_lane': [255, 255, 0],    # Yellow lanes
+            'road_boundary': [0, 255, 0],      # Green boundaries
+            'drivable_area': [0, 0, 255]      # Blue drivable area
+        }
         
-        # Previous frame memory
-        self.prev_lane_center_x = None
-        self.prev_left_lane_x = None
-        self.prev_right_lane_x = None
+        # Temporal smoothing
+        self.detection_history = deque(maxlen=5)
+        self.lane_history = deque(maxlen=8)
         
-        # Road segmentation parameters
-        self.road_color_lower = np.array([0, 0, 50])    # Dark road surface
-        self.road_color_upper = np.array([180, 50, 120]) # Light road surface
+        # Performance metrics
+        self.detection_times = deque(maxlen=30)
+        self.segmentation_times = deque(maxlen=30)
         
-        print("Robust lane detector initialized")
-        print(f"ROI covers road area from y={self.image_height//2 + 20} to y={self.image_height-80}")
+        logger.info(f"Modern lane detector initialized on {self.device}")
     
-    def segment_road(self, image):
+    def _load_models(self):
+        """Load YOLOv8 and segmentation models."""
+        try:
+            # Load YOLOv8 model for object detection
+            self.yolo_model = YOLO('yolov8n.pt')  # Start with nano for speed
+            logger.info("YOLOv8 model loaded successfully")
+            
+            # Load semantic segmentation model for lane detection
+            self.segmentation_model = smp.Unet(
+                encoder_name="resnet34",
+                encoder_weights="imagenet",
+                in_channels=3,
+                classes=4,  # ego_lane, adjacent_lane, road_boundary, drivable_area
+                activation='sigmoid'
+            ).to(self.device)
+            
+            # Load pretrained weights if available
+            try:
+                checkpoint = torch.load('models/lane_segmentation.pth', map_location=self.device)
+                self.segmentation_model.load_state_dict(checkpoint)
+                logger.info("Pretrained segmentation model loaded")
+            except FileNotFoundError:
+                logger.warning("No pretrained segmentation model found, using random weights")
+                
+        except Exception as e:
+            logger.error(f"Error loading models: {e}")
+            # Fallback to basic detection
+            self.yolo_model = None
+            self.segmentation_model = None
+    
+    def detect_objects(self, image):
         """
-        Segment the road area from the image using color and texture analysis.
-        
-        This is the foundation - we only look for lanes within the road area.
+        Detect objects using YOLOv8.
         
         Args:
-            image: RGB image from camera
+            image: Input image (BGR format)
             
         Returns:
-            road_mask: Binary mask where road pixels are white
+            dict: Detection results with vehicles, pedestrians, traffic signs
         """
-        # Convert to different color spaces for robust road detection
-        hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
-        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        if self.yolo_model is None:
+            return {'vehicles': [], 'pedestrians': [], 'traffic_signs': [], 'obstacles': []}
         
-        # Method 1: Color-based road detection
-        # Roads are typically gray/dark with low saturation
-        road_mask_color = cv2.inRange(hsv, self.road_color_lower, self.road_color_upper)
+        start_time = time.time()
         
-        # Method 2: Texture-based road detection
-        # Roads have relatively uniform texture
-        blurred = cv2.GaussianBlur(gray, (15, 15), 0)
-        texture_diff = cv2.absdiff(gray, blurred)
-        _, road_mask_texture = cv2.threshold(texture_diff, 25, 255, cv2.THRESH_BINARY_INV)
-        
-        # Method 3: Gradient-based detection
-        # Roads have fewer sharp edges than buildings/sidewalks
-        edges = cv2.Canny(gray, 50, 150)
-        kernel = np.ones((5, 5), np.uint8)
-        edges_dilated = cv2.dilate(edges, kernel, iterations=1)
-        road_mask_gradient = cv2.bitwise_not(edges_dilated)
-        
-        # Combine all methods
-        road_mask = cv2.bitwise_and(road_mask_color, road_mask_texture)
-        road_mask = cv2.bitwise_and(road_mask, road_mask_gradient)
-        
-        # Clean up the mask
-        kernel = np.ones((7, 7), np.uint8)
-        road_mask = cv2.morphologyEx(road_mask, cv2.MORPH_CLOSE, kernel)
-        road_mask = cv2.morphologyEx(road_mask, cv2.MORPH_OPEN, kernel)
-        
-        # Apply ROI to focus on the road ahead
-        roi_mask = np.zeros_like(road_mask)
-        cv2.fillPoly(roi_mask, [self.roi_vertices], 255)
-        road_mask = cv2.bitwise_and(road_mask, roi_mask)
-        
-        # Temporal smoothing for stability
-        self.road_mask_history.append(road_mask)
-        if len(self.road_mask_history) >= 3:
-            # Use majority voting across recent frames
-            stacked = np.stack(list(self.road_mask_history), axis=0)
-            road_mask = np.where(np.sum(stacked > 0, axis=0) >= 2, 255, 0).astype(np.uint8)
-        
-        return road_mask
+        try:
+            # Run YOLOv8 detection
+            results = self.yolo_model(image, verbose=False)
+            
+            # Parse results
+            detections = {
+                'vehicles': [],
+                'pedestrians': [],
+                'traffic_signs': [],
+                'obstacles': []
+            }
+            
+            for result in results:
+                boxes = result.boxes
+                if boxes is not None:
+                    for box in boxes:
+                        cls = int(box.cls[0])
+                        conf = float(box.conf[0])
+                        
+                        # Filter by confidence
+                        if conf < 0.5:
+                            continue
+                            
+                        # Get bounding box
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                        bbox = [int(x1), int(y1), int(x2), int(y2)]
+                        
+                        detection = {
+                            'bbox': bbox,
+                            'confidence': conf,
+                            'class': cls,
+                            'center': [(x1 + x2) / 2, (y1 + y2) / 2],
+                            'area': (x2 - x1) * (y2 - y1)
+                        }
+                        
+                        # Categorize detections
+                        if cls in self.vehicle_classes:
+                            detections['vehicles'].append(detection)
+                        elif cls in self.person_classes:
+                            detections['pedestrians'].append(detection)
+                        elif cls in self.traffic_classes:
+                            detections['traffic_signs'].append(detection)
+                        else:
+                            detections['obstacles'].append(detection)
+            
+            # Record detection time
+            detection_time = time.time() - start_time
+            self.detection_times.append(detection_time)
+            
+            return detections
+            
+        except Exception as e:
+            logger.error(f"Error in object detection: {e}")
+            return {'vehicles': [], 'pedestrians': [], 'traffic_signs': [], 'obstacles': []}
     
-    def detect_lane_lines_in_road(self, image, road_mask):
+    def segment_lanes(self, image):
         """
-        Detect lane lines only within the segmented road area.
+        Perform semantic segmentation for lane detection.
         
         Args:
-            image: RGB image
-            road_mask: Binary mask of road area
+            image: Input image (BGR format)
             
         Returns:
-            left_lanes, right_lanes: Lists of detected lane lines
+            dict: Segmentation results with lane masks
         """
-        # Convert to HSV for better lane marking detection
-        hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
+        if self.segmentation_model is None:
+            return self._fallback_lane_detection(image)
         
-        # Detect white lane markings
-        white_lower = np.array([0, 0, 200])
-        white_upper = np.array([180, 30, 255])
-        white_mask = cv2.inRange(hsv, white_lower, white_upper)
+        start_time = time.time()
         
-        # Detect yellow lane markings
-        yellow_lower = np.array([20, 100, 100])
-        yellow_upper = np.array([30, 255, 255])
-        yellow_mask = cv2.inRange(hsv, yellow_lower, yellow_upper)
-        
-        # Combine lane markings
-        lane_mask = cv2.bitwise_or(white_mask, yellow_mask)
-        
-        # Only look for lanes within the road area
-        lane_mask = cv2.bitwise_and(lane_mask, road_mask)
-        
-        # Apply edge detection to find lane edges
-        edges = cv2.Canny(lane_mask, 50, 150)
-        
-        # Detect lines using Hough transform
-        lines = cv2.HoughLinesP(
-            edges,
-            rho=1,
-            theta=np.pi/180,
-            threshold=30,
-            minLineLength=40,
-            maxLineGap=25
-        )
-        
-        if lines is None:
-            return [], []
-        
-        # Classify lines into left and right lanes
-        left_lanes = []
-        right_lanes = []
-        image_center_x = self.image_width // 2
-        
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
+        try:
+            # Preprocess image
+            input_tensor = self._preprocess_for_segmentation(image)
             
-            # Calculate line properties
-            if x2 - x1 == 0:
-                continue
-                
-            slope = (y2 - y1) / (x2 - x1)
-            line_center_x = (x1 + x2) / 2
-            line_length = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+            # Run segmentation
+            with torch.no_grad():
+                output = self.segmentation_model(input_tensor)
+                segmentation_mask = torch.sigmoid(output).cpu().numpy()[0]
             
-            # Filter by slope (lanes should have reasonable slope)
-            if abs(slope) < 0.3 or abs(slope) > 3.0:
-                continue
-                
-            # Filter by length
-            if line_length < 30:
-                continue
+            # Post-process segmentation results
+            lane_info = self._postprocess_segmentation(segmentation_mask, image.shape[:2])
             
-            # Check if line points toward horizon (y1 > y2 for valid lanes)
-            if y1 <= y2:
-                continue
+            # Record segmentation time
+            segmentation_time = time.time() - start_time
+            self.segmentation_times.append(segmentation_time)
             
-            # Classify based on position and slope
-            if line_center_x < image_center_x and slope < 0:
-                # Left lane (negative slope)
-                left_lanes.append(line)
-            elif line_center_x > image_center_x and slope > 0:
-                # Right lane (positive slope)  
-                right_lanes.append(line)
-        
-        return left_lanes, right_lanes
+            return lane_info
+            
+        except Exception as e:
+            logger.error(f"Error in lane segmentation: {e}")
+            return self._fallback_lane_detection(image)
     
-    def calculate_lane_center_robust(self, left_lanes, right_lanes, road_mask):
-        """
-        Calculate lane center using multiple methods for robustness.
+    def _preprocess_for_segmentation(self, image):
+        """Preprocess image for segmentation model."""
+        # Convert BGR to RGB
+        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
-        Args:
-            left_lanes: List of left lane lines
-            right_lanes: List of right lane lines
-            road_mask: Binary mask of road area
-            
-        Returns:
-            lane_center_info: Dictionary with lane center calculation
-        """
-        image_center_x = self.image_width // 2
+        # Resize to model input size
+        resized = cv2.resize(rgb_image, (256, 256))
         
-        # Method 1: Use detected lane lines
-        left_x = None
-        right_x = None
+        # Normalize
+        normalized = resized.astype(np.float32) / 255.0
         
-        if left_lanes:
-            # Average all left lane positions at bottom of image
-            left_positions = []
-            for line in left_lanes:
-                x1, y1, x2, y2 = line[0]
-                # Extrapolate to bottom of image
-                if y1 != y2:
-                    bottom_x = x1 + (x2 - x1) * (self.image_height - 80 - y1) / (y2 - y1)
-                    left_positions.append(bottom_x)
-            if left_positions:
-                left_x = np.mean(left_positions)
+        # Convert to tensor
+        tensor = torch.from_numpy(normalized).permute(2, 0, 1).unsqueeze(0).to(self.device)
         
-        if right_lanes:
-            # Average all right lane positions at bottom of image
-            right_positions = []
-            for line in right_lanes:
-                x1, y1, x2, y2 = line[0]
-                # Extrapolate to bottom of image
-                if y1 != y2:
-                    bottom_x = x1 + (x2 - x1) * (self.image_height - 80 - y1) / (y2 - y1)
-                    right_positions.append(bottom_x)
-            if right_positions:
-                right_x = np.mean(right_positions)
+        return tensor
+    
+    def _postprocess_segmentation(self, segmentation_mask, original_shape):
+        """Post-process segmentation results."""
+        h, w = original_shape
         
-        # Method 2: Use road mask center if no lanes detected
-        road_center_x = None
-        if left_x is None and right_x is None:
-            # Find the center of the road mask at the bottom
-            bottom_row = road_mask[self.image_height - 100:self.image_height - 80, :]
-            road_pixels = np.where(bottom_row > 0)
-            if len(road_pixels[1]) > 0:
-                road_left = np.min(road_pixels[1])
-                road_right = np.max(road_pixels[1])
-                road_center_x = (road_left + road_right) / 2
+        # Resize masks back to original size
+        ego_lane_mask = cv2.resize(segmentation_mask[0], (w, h))
+        adjacent_lane_mask = cv2.resize(segmentation_mask[1], (w, h))
+        road_boundary_mask = cv2.resize(segmentation_mask[2], (w, h))
+        drivable_area_mask = cv2.resize(segmentation_mask[3], (w, h))
         
-        # Calculate lane center
-        lane_center_x = None
-        confidence = 'NONE'
+        # Apply thresholds
+        ego_lane_mask = (ego_lane_mask > 0.5).astype(np.uint8)
+        adjacent_lane_mask = (adjacent_lane_mask > 0.5).astype(np.uint8)
+        road_boundary_mask = (road_boundary_mask > 0.5).astype(np.uint8)
+        drivable_area_mask = (drivable_area_mask > 0.5).astype(np.uint8)
         
-        if left_x is not None and right_x is not None:
-            # Both lanes detected
-            lane_width = abs(right_x - left_x)
-            if self.min_lane_width <= lane_width <= self.max_lane_width:
-                lane_center_x = (left_x + right_x) / 2
-                confidence = 'HIGH'
-            else:
-                # Invalid lane width, use single lane approach
-                if self.prev_lane_center_x is not None:
-                    if abs(left_x - self.prev_lane_center_x) < abs(right_x - self.prev_lane_center_x):
-                        lane_center_x = left_x + 90  # Assume 180px lane width
-                    else:
-                        lane_center_x = right_x - 90
-                else:
-                    lane_center_x = (left_x + right_x) / 2
-                confidence = 'MEDIUM'
-                
-        elif left_x is not None:
-            # Only left lane detected
-            lane_center_x = left_x + 90  # Assume we're 90px from left edge
-            confidence = 'LOW'
-            
-        elif right_x is not None:
-            # Only right lane detected
-            lane_center_x = right_x - 90  # Assume we're 90px from right edge
-            confidence = 'LOW'
-            
-        elif road_center_x is not None:
-            # No lanes, but road detected - follow road center
-            lane_center_x = road_center_x
-            confidence = 'LOW'
-            
-        else:
-            # Nothing detected - use previous position or image center
-            if self.prev_lane_center_x is not None:
-                lane_center_x = self.prev_lane_center_x
-            else:
-                lane_center_x = image_center_x
-            confidence = 'NONE'
+        # Extract lane information
+        lane_info = {
+            'ego_lane_mask': ego_lane_mask,
+            'adjacent_lane_mask': adjacent_lane_mask,
+            'road_boundary_mask': road_boundary_mask,
+            'drivable_area_mask': drivable_area_mask,
+            'lane_center': self._calculate_lane_center(ego_lane_mask, drivable_area_mask),
+            'lane_confidence': self._calculate_lane_confidence(ego_lane_mask),
+            'safe_driving_area': self._calculate_safe_area(drivable_area_mask, road_boundary_mask)
+        }
         
-        # Apply temporal smoothing and safety constraints
-        if lane_center_x is not None:
-            # Limit sudden changes
-            if self.prev_lane_center_x is not None:
-                max_change = 30
-                if abs(lane_center_x - self.prev_lane_center_x) > max_change:
-                    direction = 1 if lane_center_x > self.prev_lane_center_x else -1
-                    lane_center_x = self.prev_lane_center_x + (direction * max_change)
-            
-            # Keep within safe boundaries (20% to 80% of image width)
-            safe_left = self.image_width * 0.20
-            safe_right = self.image_width * 0.80
-            lane_center_x = np.clip(lane_center_x, safe_left, safe_right)
-            
-            # Add to history for smoothing
-            self.lane_center_history.append(lane_center_x)
-            
-            # Apply temporal smoothing
-            if len(self.lane_center_history) >= 5:
-                weights = np.exp(np.linspace(-1, 0, len(self.lane_center_history)))
-                weights = weights / np.sum(weights)
-                lane_center_x = np.average(list(self.lane_center_history), weights=weights)
+        return lane_info
+    
+    def _calculate_lane_center(self, ego_lane_mask, drivable_area_mask):
+        """Calculate the center of the ego lane."""
+        if np.sum(ego_lane_mask) == 0:
+            # Fallback to drivable area center
+            if np.sum(drivable_area_mask) > 0:
+                moments = cv2.moments(drivable_area_mask)
+                if moments['m00'] != 0:
+                    return int(moments['m10'] / moments['m00'])
+            return self.image_width // 2
         
-        # Calculate steering error
-        steering_error = None
-        steering_direction = 'UNKNOWN'
+        # Find lane center from ego lane mask
+        lane_points = np.where(ego_lane_mask > 0)
+        if len(lane_points[1]) > 0:
+            return int(np.mean(lane_points[1]))
         
-        if lane_center_x is not None:
-            steering_error = lane_center_x - image_center_x
-            
-            # Adaptive dead zone based on confidence
-            dead_zone = {
-                'HIGH': 15,
-                'MEDIUM': 25,
-                'LOW': 35,
-                'NONE': 50
-            }.get(confidence, 50)
-            
-            if abs(steering_error) < dead_zone:
-                steering_direction = 'STRAIGHT'
-            elif steering_error > 0:
-                steering_direction = 'STEER_LEFT'
-            else:
-                steering_direction = 'STEER_RIGHT'
+        return self.image_width // 2
+    
+    def _calculate_lane_confidence(self, ego_lane_mask):
+        """Calculate confidence in lane detection."""
+        total_pixels = ego_lane_mask.shape[0] * ego_lane_mask.shape[1]
+        lane_pixels = np.sum(ego_lane_mask)
         
-        # Update memory
-        self.prev_lane_center_x = lane_center_x
-        self.prev_left_lane_x = left_x
-        self.prev_right_lane_x = right_x
+        # Confidence based on lane pixel density
+        confidence = min(lane_pixels / (total_pixels * 0.1), 1.0)
+        return confidence
+    
+    def _calculate_safe_area(self, drivable_area_mask, road_boundary_mask):
+        """Calculate safe driving area."""
+        # Combine drivable area and exclude road boundaries
+        safe_area = drivable_area_mask.copy()
+        safe_area[road_boundary_mask > 0] = 0
+        
+        return safe_area
+    
+    def _fallback_lane_detection(self, image):
+        """Fallback lane detection using traditional computer vision."""
+        # Convert to grayscale
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        
+        # Apply Gaussian blur
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        
+        # Edge detection
+        edges = cv2.Canny(blurred, 50, 150)
+        
+        # Create basic lane info
+        lane_center = self.image_width // 2
+        confidence = 0.3  # Low confidence for fallback
+        
+        # Create basic masks
+        ego_lane_mask = np.zeros((self.image_height, self.image_width), dtype=np.uint8)
+        drivable_area_mask = np.ones((self.image_height, self.image_width), dtype=np.uint8)
         
         return {
-            'has_left_lane': left_x is not None,
-            'has_right_lane': right_x is not None,
-            'left_lane_x': left_x,
-            'right_lane_x': right_x,
-            'lane_center_x': lane_center_x,
-            'steering_error': steering_error,
-            'steering_direction': steering_direction,
-            'confidence': confidence,
-            'safety_status': 'SAFE' if confidence in ['HIGH', 'MEDIUM'] else 'CAUTION'
+            'ego_lane_mask': ego_lane_mask,
+            'adjacent_lane_mask': np.zeros_like(ego_lane_mask),
+            'road_boundary_mask': np.zeros_like(ego_lane_mask),
+            'drivable_area_mask': drivable_area_mask,
+            'lane_center': lane_center,
+            'lane_confidence': confidence,
+            'safe_driving_area': drivable_area_mask
         }
     
-    def detect_obstacles_basic(self, image, road_mask):
+    def process_frame(self, image):
         """
-        Basic obstacle detection within the road area.
-        
-        This is a simple implementation - for full functionality,
-        you'd want to use CARLA's LiDAR or depth sensors.
+        Process a single frame with modern computer vision techniques.
         
         Args:
-            image: RGB image
-            road_mask: Binary mask of road area
+            image: Input image from camera
             
         Returns:
-            obstacles: List of detected obstacle bounding boxes
+            dict: Complete analysis results
         """
-        # Convert to HSV for better object detection
-        hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
+        # Object detection
+        objects = self.detect_objects(image)
         
-        # Detect non-road objects (cars, pedestrians, etc.)
-        # Cars are typically darker than the road
-        car_lower = np.array([0, 0, 0])
-        car_upper = np.array([180, 255, 80])
-        car_mask = cv2.inRange(hsv, car_lower, car_upper)
+        # Lane segmentation
+        lanes = self.segment_lanes(image)
         
-        # Only look for obstacles within the road area
-        obstacle_mask = cv2.bitwise_and(car_mask, road_mask)
+        # Combine results with temporal smoothing
+        results = self._combine_and_smooth_results(objects, lanes)
         
-        # Find contours (potential obstacles)
-        contours, _ = cv2.findContours(obstacle_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        obstacles = []
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area > 500:  # Filter small noise
-                x, y, w, h = cv2.boundingRect(contour)
-                # Only consider obstacles in the lower half of the image (closer to vehicle)
-                if y > self.image_height // 2:
-                    obstacles.append((x, y, w, h))
-        
-        return obstacles
-    
-    def process_image(self, image):
-        """
-        Complete robust lane detection pipeline.
-        
-        Args:
-            image: Raw camera image from CARLA
-            
-        Returns:
-            result_image: Image with detection overlays
-            lane_info: Dictionary with lane detection results
-        """
-        # Step 1: Segment the road area
-        road_mask = self.segment_road(image)
-        
-        # Step 2: Detect lane lines within the road area
-        left_lanes, right_lanes = self.detect_lane_lines_in_road(image, road_mask)
-        
-        # Step 3: Calculate robust lane center
-        lane_center_info = self.calculate_lane_center_robust(left_lanes, right_lanes, road_mask)
-        
-        # Step 4: Basic obstacle detection
-        obstacles = self.detect_obstacles_basic(image, road_mask)
-        
-        # Step 5: Create result image with overlays
-        result_image = image.copy()
-        
-        # Draw road mask (semi-transparent green overlay)
-        road_overlay = np.zeros_like(image)
-        road_overlay[road_mask > 0] = [0, 255, 0]  # Green for road
-        result_image = cv2.addWeighted(result_image, 0.8, road_overlay, 0.2, 0)
-        
-        # Draw detected lane lines
-        for line in left_lanes:
-            x1, y1, x2, y2 = line[0]
-            cv2.line(result_image, (x1, y1), (x2, y2), (0, 255, 255), 3)  # Yellow for left
-            
-        for line in right_lanes:
-            x1, y1, x2, y2 = line[0]
-            cv2.line(result_image, (x1, y1), (x2, y2), (255, 0, 255), 3)  # Magenta for right
-        
-        # Draw lane center
-        if lane_center_info['lane_center_x'] is not None:
-            center_x = int(lane_center_info['lane_center_x'])
-            color = (0, 255, 0) if lane_center_info['confidence'] in ['HIGH', 'MEDIUM'] else (0, 165, 255)
-            cv2.line(result_image, (center_x, 0), (center_x, self.image_height), color, 2)
-            cv2.circle(result_image, (center_x, self.image_height - 50), 8, color, -1)
-        
-        # Draw vehicle center reference
-        cv2.line(result_image, (self.image_width // 2, 0), (self.image_width // 2, self.image_height), (255, 255, 255), 1)
-        
-        # Draw ROI
-        cv2.polylines(result_image, [self.roi_vertices], True, (255, 255, 0), 2)
-        
-        # Draw obstacles
-        for (x, y, w, h) in obstacles:
-            cv2.rectangle(result_image, (x, y), (x + w, y + h), (0, 0, 255), 2)
-            cv2.putText(result_image, "OBSTACLE", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-        
-        # Add status text
-        status_text = f"Confidence: {lane_center_info['confidence']} | Status: {lane_center_info['safety_status']}"
-        cv2.putText(result_image, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        
-        if obstacles:
-            cv2.putText(result_image, f"OBSTACLES DETECTED: {len(obstacles)}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        
-        # Prepare lane info
-        lane_info = {
-            'total_lines': len(left_lanes) + len(right_lanes),
-            'left_lanes': len(left_lanes),
-            'right_lanes': len(right_lanes),
-            'obstacles_detected': len(obstacles),
-            'road_area_detected': np.sum(road_mask > 0) > 1000,  # Minimum road area
-            'lane_center': lane_center_info
+        # Add performance metrics
+        results['performance'] = {
+            'avg_detection_time': np.mean(self.detection_times) if self.detection_times else 0,
+            'avg_segmentation_time': np.mean(self.segmentation_times) if self.segmentation_times else 0,
+            'fps': 1.0 / (results['total_processing_time'] + 1e-6)
         }
         
-        return result_image, lane_info 
+        return results
+    
+    def _combine_and_smooth_results(self, objects, lanes):
+        """Combine object detection and lane segmentation results with temporal smoothing."""
+        # Calculate processing time
+        total_time = (np.mean(self.detection_times) if self.detection_times else 0) + \
+                    (np.mean(self.segmentation_times) if self.segmentation_times else 0)
+        
+        # Temporal smoothing for lane center
+        current_center = lanes['lane_center']
+        if self.lane_history:
+            # Weighted average with history
+            weights = np.exp(np.linspace(-2, 0, len(self.lane_history)))
+            weights = weights / np.sum(weights)
+            
+            historical_centers = [info['lane_center'] for info in self.lane_history]
+            smoothed_center = np.average(historical_centers + [current_center], 
+                                       weights=list(weights) + [0.4])
+            lanes['lane_center'] = int(smoothed_center)
+        
+        # Add to history
+        self.lane_history.append(lanes.copy())
+        
+        # Assess safety
+        safety_assessment = self._assess_safety(objects, lanes)
+        
+        results = {
+            'objects': objects,
+            'lanes': lanes,
+            'safety': safety_assessment,
+            'lane_center': lanes['lane_center'],
+            'lane_confidence': lanes['lane_confidence'],
+            'steering_error': lanes['lane_center'] - self.image_width // 2,
+            'total_processing_time': total_time
+        }
+        
+        return results
+    
+    def _assess_safety(self, objects, lanes):
+        """Assess safety based on detected objects and lane information."""
+        safety_score = 1.0
+        warnings = []
+        
+        # Check for vehicles in ego lane
+        ego_lane_mask = lanes['ego_lane_mask']
+        for vehicle in objects['vehicles']:
+            x1, y1, x2, y2 = vehicle['bbox']
+            # Check if vehicle overlaps with ego lane
+            vehicle_center_x = (x1 + x2) // 2
+            vehicle_center_y = (y1 + y2) // 2
+            
+            if 0 <= vehicle_center_y < ego_lane_mask.shape[0] and \
+               0 <= vehicle_center_x < ego_lane_mask.shape[1]:
+                if ego_lane_mask[vehicle_center_y, vehicle_center_x] > 0:
+                    safety_score *= 0.5
+                    warnings.append(f"Vehicle detected in ego lane (confidence: {vehicle['confidence']:.2f})")
+        
+        # Check for pedestrians
+        for pedestrian in objects['pedestrians']:
+            safety_score *= 0.7
+            warnings.append(f"Pedestrian detected (confidence: {pedestrian['confidence']:.2f})")
+        
+        # Check lane confidence
+        if lanes['lane_confidence'] < 0.5:
+            safety_score *= 0.8
+            warnings.append("Low lane detection confidence")
+        
+        return {
+            'safety_score': safety_score,
+            'warnings': warnings,
+            'emergency_brake': safety_score < 0.3,
+            'reduce_speed': safety_score < 0.6
+        }
+    
+    def visualize_results(self, image, results):
+        """Visualize detection and segmentation results."""
+        vis_image = image.copy()
+        
+        # Draw object detections
+        self._draw_object_detections(vis_image, results['objects'])
+        
+        # Draw lane segmentation
+        self._draw_lane_segmentation(vis_image, results['lanes'])
+        
+        # Draw safety information
+        self._draw_safety_info(vis_image, results['safety'])
+        
+        # Draw performance metrics
+        self._draw_performance_metrics(vis_image, results.get('performance', {}))
+        
+        return vis_image
+    
+    def _draw_object_detections(self, image, objects):
+        """Draw object detection results."""
+        # Draw vehicles (red)
+        for vehicle in objects['vehicles']:
+            x1, y1, x2, y2 = vehicle['bbox']
+            cv2.rectangle(image, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            cv2.putText(image, f"Vehicle {vehicle['confidence']:.2f}", 
+                       (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+        
+        # Draw pedestrians (orange)
+        for pedestrian in objects['pedestrians']:
+            x1, y1, x2, y2 = pedestrian['bbox']
+            cv2.rectangle(image, (x1, y1), (x2, y2), (0, 165, 255), 2)
+            cv2.putText(image, f"Person {pedestrian['confidence']:.2f}", 
+                       (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+        
+        # Draw traffic signs (green)
+        for sign in objects['traffic_signs']:
+            x1, y1, x2, y2 = sign['bbox']
+            cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(image, f"Sign {sign['confidence']:.2f}", 
+                       (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+    
+    def _draw_lane_segmentation(self, image, lanes):
+        """Draw lane segmentation results."""
+        # Create colored overlay
+        overlay = np.zeros_like(image)
+        
+        # Draw ego lane (white)
+        overlay[lanes['ego_lane_mask'] > 0] = [255, 255, 255]
+        
+        # Draw adjacent lanes (yellow)
+        overlay[lanes['adjacent_lane_mask'] > 0] = [0, 255, 255]
+        
+        # Draw road boundaries (green)
+        overlay[lanes['road_boundary_mask'] > 0] = [0, 255, 0]
+        
+        # Draw drivable area (blue, semi-transparent)
+        overlay[lanes['drivable_area_mask'] > 0] = [255, 0, 0]
+        
+        # Blend with original image
+        cv2.addWeighted(image, 0.7, overlay, 0.3, 0, image)
+        
+        # Draw lane center line
+        center_x = lanes['lane_center']
+        cv2.line(image, (center_x, 0), (center_x, image.shape[0]), (0, 255, 255), 2)
+    
+    def _draw_safety_info(self, image, safety):
+        """Draw safety information."""
+        # Safety score
+        color = (0, 255, 0) if safety['safety_score'] > 0.7 else \
+                (0, 255, 255) if safety['safety_score'] > 0.4 else (0, 0, 255)
+        
+        cv2.putText(image, f"Safety: {safety['safety_score']:.2f}", 
+                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        
+        # Warnings
+        y_offset = 60
+        for warning in safety['warnings']:
+            cv2.putText(image, warning, (10, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            y_offset += 20
+    
+    def _draw_performance_metrics(self, image, performance):
+        """Draw performance metrics."""
+        if not performance:
+            return
+            
+        y_pos = image.shape[0] - 60
+        cv2.putText(image, f"FPS: {performance.get('fps', 0):.1f}", 
+                   (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        cv2.putText(image, f"Det: {performance.get('avg_detection_time', 0)*1000:.1f}ms", 
+                   (10, y_pos + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        cv2.putText(image, f"Seg: {performance.get('avg_segmentation_time', 0)*1000:.1f}ms", 
+                   (10, y_pos + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    
+    def get_status(self):
+        """Get current system status."""
+        return {
+            'models_loaded': self.yolo_model is not None and self.segmentation_model is not None,
+            'device': str(self.device),
+            'yolo_available': self.yolo_model is not None,
+            'segmentation_available': self.segmentation_model is not None,
+            'avg_fps': 1.0 / (np.mean(self.detection_times) + np.mean(self.segmentation_times) + 1e-6) if self.detection_times and self.segmentation_times else 0
+        } 
