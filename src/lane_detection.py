@@ -4,306 +4,162 @@ from collections import deque
 
 class LaneDetector:
     """
-    Advanced lane detection system for autonomous driving with safety-first approach.
+    Robust lane detection system for autonomous driving.
     
-    This class implements:
-    1. Proper ROI that connects to frame edges
-    2. Lane divider detection to prevent illegal lane changes
-    3. Sidewalk classification to prevent sidewalk approach
-    4. Strict lane boundary enforcement
-    5. Enhanced color detection for road markings
+    This system implements a multi-stage approach:
+    1. Road segmentation to identify drivable areas
+    2. Lane detection within road boundaries only
+    3. Path planning within detected lanes
+    4. Basic obstacle awareness
     """
     
     def __init__(self):
-        """Initialize the enhanced lane detector with safety-focused parameters."""
-        # Image dimensions (should match camera settings)
+        """Initialize the robust lane detector."""
+        # Image dimensions
         self.image_width = 640
         self.image_height = 480
         
-        # FIXED: ROI trapezoid that connects to frame edges
-        # This ensures we capture all lane markings at the frame boundaries
+        # Define a more focused ROI that covers the road ahead
         self.roi_vertices = np.array([
-            [0, self.image_height - 80],                    # Bottom left - connected to edge
-            [self.image_width // 2 - 120, self.image_height // 2 - 60],  # Top left - wider for distant detection
-            [self.image_width // 2 + 120, self.image_height // 2 - 60],  # Top right - wider for distant detection
-            [self.image_width - 1, self.image_height - 80]  # Bottom right - connected to edge
+            [0, self.image_height - 80],                    # Bottom left
+            [self.image_width // 2 - 150, self.image_height // 2 + 20],  # Top left
+            [self.image_width // 2 + 150, self.image_height // 2 + 20],  # Top right  
+            [self.image_width - 1, self.image_height - 80]  # Bottom right
         ], dtype=np.int32)
         
-        # Enhanced temporal filtering for stability
-        self.history_size = 8  # Optimized history size
+        # Temporal filtering
+        self.history_size = 10
         self.lane_center_history = deque(maxlen=self.history_size)
-        self.left_lane_history = deque(maxlen=self.history_size)
-        self.right_lane_history = deque(maxlen=self.history_size)
-        self.lane_divider_history = deque(maxlen=self.history_size)
+        self.road_mask_history = deque(maxlen=5)  # For road segmentation stability
         
-        # Safety boundaries for lane enforcement
-        self.road_left_boundary = self.image_width * 0.25   # 25% from left edge
-        self.road_right_boundary = self.image_width * 0.75  # 75% from right edge
-        self.lane_center_safe_zone = (self.image_width * 0.40, self.image_width * 0.60)  # Safe driving zone
+        # Lane detection parameters
+        self.min_lane_width = 80   # Minimum pixels between lane lines
+        self.max_lane_width = 200  # Maximum pixels between lane lines
+        self.outlier_threshold = 40  # Reduced for more stable detection
         
-        # Detection confidence tracking
-        self.min_confidence_lines = 2
-        self.outlier_threshold = 60  # Balanced threshold
-        
-        # Previous frame memory for validation
+        # Previous frame memory
+        self.prev_lane_center_x = None
         self.prev_left_lane_x = None
         self.prev_right_lane_x = None
-        self.prev_lane_center_x = None
-        self.prev_lane_divider_x = None
-        self.prev_steering_direction = 'STRAIGHT'
         
-        # Safety state tracking
-        self.sidewalk_detected = False
-        self.lane_divider_detected = False
-        self.illegal_lane_change_risk = False
+        # Road segmentation parameters
+        self.road_color_lower = np.array([0, 0, 50])    # Dark road surface
+        self.road_color_upper = np.array([180, 50, 120]) # Light road surface
         
-        print("Enhanced lane detector initialized with safety-first approach")
-        print(f"ROI connects to frame edges: (0,{self.image_height-80}) to ({self.image_width-1},{self.image_height-80})")
+        print("Robust lane detector initialized")
+        print(f"ROI covers road area from y={self.image_height//2 + 20} to y={self.image_height-80}")
     
-    def preprocess_image(self, image):
+    def segment_road(self, image):
         """
-        Enhanced preprocessing with multi-target detection for lanes, dividers, and sidewalks.
+        Segment the road area from the image using color and texture analysis.
+        
+        This is the foundation - we only look for lanes within the road area.
         
         Args:
-            image: RGB image from CARLA camera
+            image: RGB image from camera
             
         Returns:
-            Dictionary containing different processed images for various detection targets
+            road_mask: Binary mask where road pixels are white
         """
-        # Convert RGB to HSV for better color segmentation
+        # Convert to different color spaces for robust road detection
+        hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        
+        # Method 1: Color-based road detection
+        # Roads are typically gray/dark with low saturation
+        road_mask_color = cv2.inRange(hsv, self.road_color_lower, self.road_color_upper)
+        
+        # Method 2: Texture-based road detection
+        # Roads have relatively uniform texture
+        blurred = cv2.GaussianBlur(gray, (15, 15), 0)
+        texture_diff = cv2.absdiff(gray, blurred)
+        _, road_mask_texture = cv2.threshold(texture_diff, 25, 255, cv2.THRESH_BINARY_INV)
+        
+        # Method 3: Gradient-based detection
+        # Roads have fewer sharp edges than buildings/sidewalks
+        edges = cv2.Canny(gray, 50, 150)
+        kernel = np.ones((5, 5), np.uint8)
+        edges_dilated = cv2.dilate(edges, kernel, iterations=1)
+        road_mask_gradient = cv2.bitwise_not(edges_dilated)
+        
+        # Combine all methods
+        road_mask = cv2.bitwise_and(road_mask_color, road_mask_texture)
+        road_mask = cv2.bitwise_and(road_mask, road_mask_gradient)
+        
+        # Clean up the mask
+        kernel = np.ones((7, 7), np.uint8)
+        road_mask = cv2.morphologyEx(road_mask, cv2.MORPH_CLOSE, kernel)
+        road_mask = cv2.morphologyEx(road_mask, cv2.MORPH_OPEN, kernel)
+        
+        # Apply ROI to focus on the road ahead
+        roi_mask = np.zeros_like(road_mask)
+        cv2.fillPoly(roi_mask, [self.roi_vertices], 255)
+        road_mask = cv2.bitwise_and(road_mask, roi_mask)
+        
+        # Temporal smoothing for stability
+        self.road_mask_history.append(road_mask)
+        if len(self.road_mask_history) >= 3:
+            # Use majority voting across recent frames
+            stacked = np.stack(list(self.road_mask_history), axis=0)
+            road_mask = np.where(np.sum(stacked > 0, axis=0) >= 2, 255, 0).astype(np.uint8)
+        
+        return road_mask
+    
+    def detect_lane_lines_in_road(self, image, road_mask):
+        """
+        Detect lane lines only within the segmented road area.
+        
+        Args:
+            image: RGB image
+            road_mask: Binary mask of road area
+            
+        Returns:
+            left_lanes, right_lanes: Lists of detected lane lines
+        """
+        # Convert to HSV for better lane marking detection
         hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
         
-        # 1. WHITE LANE MARKINGS (dashed lines on road edges)
-        white_lower = np.array([0, 0, 180])     # Bright white with some tolerance
-        white_upper = np.array([180, 40, 255])  # Allow slight color variation
+        # Detect white lane markings
+        white_lower = np.array([0, 0, 200])
+        white_upper = np.array([180, 30, 255])
         white_mask = cv2.inRange(hsv, white_lower, white_upper)
         
-        # 2. YELLOW LANE DIVIDERS (center lines separating opposing traffic)
-        yellow_lower = np.array([20, 100, 100])  # True yellow range
+        # Detect yellow lane markings
+        yellow_lower = np.array([20, 100, 100])
         yellow_upper = np.array([30, 255, 255])
         yellow_mask = cv2.inRange(hsv, yellow_lower, yellow_upper)
         
-        # 3. GRAY SIDEWALKS (concrete/asphalt sidewalks)
-        gray_lower = np.array([0, 0, 80])       # Dark gray
-        gray_upper = np.array([180, 50, 150])   # Light gray
-        gray_mask = cv2.inRange(hsv, gray_lower, gray_upper)
-        
-        # Create combined lane mask (white + yellow)
+        # Combine lane markings
         lane_mask = cv2.bitwise_or(white_mask, yellow_mask)
         
-        # Apply morphological operations to clean up masks
-        kernel = np.ones((3,3), np.uint8)
-        lane_mask = cv2.morphologyEx(lane_mask, cv2.MORPH_CLOSE, kernel)
-        gray_mask = cv2.morphologyEx(gray_mask, cv2.MORPH_CLOSE, kernel)
+        # Only look for lanes within the road area
+        lane_mask = cv2.bitwise_and(lane_mask, road_mask)
         
-        # Create processed images for different detection targets
-        lane_image = cv2.bitwise_and(image, image, mask=lane_mask)
-        sidewalk_image = cv2.bitwise_and(image, image, mask=gray_mask)
+        # Apply edge detection to find lane edges
+        edges = cv2.Canny(lane_mask, 50, 150)
         
-        # Convert to grayscale for edge detection
-        lane_gray = cv2.cvtColor(lane_image, cv2.COLOR_RGB2GRAY)
-        sidewalk_gray = cv2.cvtColor(sidewalk_image, cv2.COLOR_RGB2GRAY)
-        
-        # Apply Gaussian blur
-        lane_blurred = cv2.GaussianBlur(lane_gray, (5, 5), 0)
-        sidewalk_blurred = cv2.GaussianBlur(sidewalk_gray, (7, 7), 0)
-        
-        # Canny edge detection with optimized parameters
-        lane_edges = cv2.Canny(lane_blurred, 50, 150)
-        sidewalk_edges = cv2.Canny(sidewalk_blurred, 30, 100)
-        
-        return {
-            'lane_edges': lane_edges,
-            'sidewalk_edges': sidewalk_edges,
-            'white_mask': white_mask,
-            'yellow_mask': yellow_mask,
-            'gray_mask': gray_mask,
-            'combined_edges': cv2.bitwise_or(lane_edges, sidewalk_edges)
-        }
-    
-    def apply_region_of_interest(self, image):
-        """
-        Apply ROI mask that connects to frame edges for complete lane detection.
-        
-        Args:
-            image: Edge-detected image
-            
-        Returns:
-            masked_image: Image with ROI applied
-        """
-        # Create mask
-        mask = np.zeros_like(image)
-        cv2.fillPoly(mask, [self.roi_vertices], 255)
-        
-        # Apply mask
-        masked_image = cv2.bitwise_and(image, mask)
-        
-        return masked_image
-    
-    def detect_sidewalks(self, sidewalk_edges):
-        """
-        Detect sidewalks to prevent vehicle from approaching them.
-        
-        Args:
-            sidewalk_edges: Edge-detected sidewalk image
-            
-        Returns:
-            sidewalk_boundaries: List of detected sidewalk boundaries
-        """
-        # Apply ROI to sidewalk detection
-        masked_sidewalk = self.apply_region_of_interest(sidewalk_edges)
-        
-        # Detect lines in sidewalk areas
+        # Detect lines using Hough transform
         lines = cv2.HoughLinesP(
-            masked_sidewalk,
+            edges,
             rho=1,
             theta=np.pi/180,
-            threshold=40,
-            minLineLength=50,
-            maxLineGap=20
+            threshold=30,
+            minLineLength=40,
+            maxLineGap=25
         )
         
-        sidewalk_boundaries = []
-        if lines is not None:
-            for line in lines:
-                x1, y1, x2, y2 = line[0]
-                
-                # Check if line is horizontal (sidewalk edge)
-                if abs(y2 - y1) < 20:  # Nearly horizontal
-                    line_center_x = (x1 + x2) / 2
-                    
-                    # Check if it's at the edges (likely sidewalk)
-                    if line_center_x < self.image_width * 0.3 or line_center_x > self.image_width * 0.7:
-                        sidewalk_boundaries.append(line)
-        
-        self.sidewalk_detected = len(sidewalk_boundaries) > 0
-        return sidewalk_boundaries
-    
-    def detect_lane_dividers(self, yellow_mask):
-        """
-        Detect yellow lane dividers that separate opposing traffic lanes.
-        
-        Args:
-            yellow_mask: Binary mask of yellow pixels
-            
-        Returns:
-            lane_divider_x: X-coordinate of detected lane divider, or None
-        """
-        # Apply ROI to yellow mask
-        masked_yellow = self.apply_region_of_interest(yellow_mask)
-        
-        # Find contours in yellow mask
-        contours, _ = cv2.findContours(masked_yellow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        lane_divider_candidates = []
-        
-        for contour in contours:
-            # Calculate contour properties
-            area = cv2.contourArea(contour)
-            if area < 100:  # Too small to be a lane divider
-                continue
-                
-            # Get bounding rectangle
-            x, y, w, h = cv2.boundingRect(contour)
-            
-            # Check if it's vertical (lane divider characteristic)
-            aspect_ratio = h / w if w > 0 else 0
-            if aspect_ratio > 2:  # Vertical line
-                center_x = x + w // 2
-                
-                # Check if it's in the center area (where dividers should be)
-                if self.image_width * 0.4 < center_x < self.image_width * 0.6:
-                    lane_divider_candidates.append(center_x)
-        
-        # Select the most central divider
-        if lane_divider_candidates:
-            image_center = self.image_width // 2
-            lane_divider_x = min(lane_divider_candidates, key=lambda x: abs(x - image_center))
-            self.lane_divider_detected = True
-            return lane_divider_x
-        
-        self.lane_divider_detected = False
-        return None
-    
-    def detect_lines(self, image):
-        """
-        Detect lines with enhanced parameters for better lane marking detection.
-        
-        Args:
-            image: Masked edge image
-            
-        Returns:
-            lines: Array of detected lines
-        """
-        lines = cv2.HoughLinesP(
-            image,
-            rho=1,
-            theta=np.pi/180,
-            threshold=30,       # Lowered for better detection
-            minLineLength=30,   # Shorter for distant markings
-            maxLineGap=20       # Larger gap for dashed lines
-        )
-        
-        return lines
-
-    def filter_outliers(self, lines, expected_position=None, side='unknown'):
-        """
-        Filter out lines that are too far from expected position.
-        
-        Args:
-            lines: List of lines to filter
-            expected_position: Expected X position (from previous frame)
-            side: 'left' or 'right' for debugging
-            
-        Returns:
-            filtered_lines: Lines that are close to expected position
-        """
-        if not lines or expected_position is None:
-            return lines
-            
-        filtered_lines = []
-        
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            line_center_x = (x1 + x2) / 2
-            
-            # Check if line is within reasonable distance from expected position
-            if abs(line_center_x - expected_position) <= self.outlier_threshold:
-                filtered_lines.append(line)
-        
-        return filtered_lines
-
-    def classify_lanes_with_safety(self, lines, lane_divider_x=None):
-        """
-        Enhanced lane classification with safety boundaries and divider awareness.
-        
-        Args:
-            lines: Array of detected lines from Hough transform
-            lane_divider_x: X-coordinate of detected lane divider
-            
-        Returns:
-            left_lanes: List of left lane lines
-            right_lanes: List of right lane lines
-            safe_lanes: List of lanes that are safe to follow
-        """
         if lines is None:
-            return [], [], []
-            
+            return [], []
+        
+        # Classify lines into left and right lanes
         left_lanes = []
         right_lanes = []
-        safe_lanes = []
-        
         image_center_x = self.image_width // 2
-        
-        # Enhanced validation parameters
-        min_slope_threshold = 0.3
-        max_slope_threshold = 3.0
-        min_line_length = 25
         
         for line in lines:
             x1, y1, x2, y2 = line[0]
             
-            # Basic line validation
+            # Calculate line properties
             if x2 - x1 == 0:
                 continue
                 
@@ -311,364 +167,299 @@ class LaneDetector:
             line_center_x = (x1 + x2) / 2
             line_length = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
             
-            # Validate slope and length
-            if abs(slope) < min_slope_threshold or abs(slope) > max_slope_threshold:
-                continue
-            if line_length < min_line_length:
+            # Filter by slope (lanes should have reasonable slope)
+            if abs(slope) < 0.3 or abs(slope) > 3.0:
                 continue
                 
-            # Orientation check - lines should point toward horizon
-            if y1 <= y2:  # Wrong direction
+            # Filter by length
+            if line_length < 30:
                 continue
             
-            # SAFETY CHECK: Avoid lines too close to sidewalks
-            if (line_center_x < self.road_left_boundary or 
-                line_center_x > self.road_right_boundary):
+            # Check if line points toward horizon (y1 > y2 for valid lanes)
+            if y1 <= y2:
                 continue
             
-            # SAFETY CHECK: If lane divider detected, don't cross it
-            if lane_divider_x is not None:
-                # If we're on the right side of the road, don't detect lanes on the left side of divider
-                if line_center_x < lane_divider_x - 20:  # 20px buffer
-                    continue  # This is oncoming traffic lane - ILLEGAL
-            
-            # Classify based on position
-            if line_center_x < image_center_x:
+            # Classify based on position and slope
+            if line_center_x < image_center_x and slope < 0:
+                # Left lane (negative slope)
                 left_lanes.append(line)
-                # Check if it's in our safe driving zone
-                if line_center_x > self.lane_center_safe_zone[0] - 50:
-                    safe_lanes.append(line)
-            else:
+            elif line_center_x > image_center_x and slope > 0:
+                # Right lane (positive slope)  
                 right_lanes.append(line)
-                # Check if it's in our safe driving zone
-                if line_center_x < self.lane_center_safe_zone[1] + 50:
-                    safe_lanes.append(line)
         
-        # Filter outliers based on previous frame
-        left_lanes = self.filter_outliers(left_lanes, self.prev_left_lane_x, 'left')
-        right_lanes = self.filter_outliers(right_lanes, self.prev_right_lane_x, 'right')
-        
-        return left_lanes, right_lanes, safe_lanes
-
-    def calculate_stable_lane_position(self, lanes, history_deque, prev_position):
+        return left_lanes, right_lanes
+    
+    def calculate_lane_center_robust(self, left_lanes, right_lanes, road_mask):
         """
-        Calculate stable lane position using enhanced temporal filtering and outlier rejection.
-        
-        Args:
-            lanes: List of lane lines
-            history_deque: Deque storing historical positions
-            prev_position: Previous frame position for validation
-            
-        Returns:
-            stable_position: Smoothed lane position, or None if not confident
-        """
-        if not lanes:
-            return None
-            
-        # Calculate current frame position
-        x_positions = []
-        for line in lanes:
-            x1, y1, x2, y2 = line[0]
-            # Use the bottom point (closer to vehicle) for more accurate steering
-            if y1 > y2:  # y1 is lower in image (closer to vehicle)
-                x_positions.append(x1)
-            else:  # y2 is lower in image
-                x_positions.append(x2)
-        
-        if not x_positions:
-            return None
-            
-        # Current frame average
-        current_position = sum(x_positions) / len(x_positions)
-        
-        # Limit position change to prevent sudden jumps
-        if prev_position is not None:
-            max_change = 30  # Maximum pixel change between frames
-            if abs(current_position - prev_position) > max_change:
-                # Limit the change to max_change pixels
-                direction = 1 if current_position > prev_position else -1
-                current_position = prev_position + (direction * max_change)
-        
-        # Add to history
-        history_deque.append(current_position)
-        
-        # Calculate smoothed position using exponential weighted average
-        # More recent frames have much higher weight
-        if len(history_deque) >= 3:  # Need at least 3 frames for stability
-            # Exponential weights: recent frames have exponentially more influence
-            weights = np.exp(np.linspace(-2, 0, len(history_deque)))
-            weights = weights / np.sum(weights)
-            stable_position = np.average(list(history_deque), weights=weights)
-        else:
-            stable_position = current_position
-            
-        return stable_position
-
-    def calculate_safe_lane_center(self, left_lanes, right_lanes, safe_lanes, lane_divider_x=None):
-        """
-        Calculate lane center with strict safety enforcement and divider awareness.
+        Calculate lane center using multiple methods for robustness.
         
         Args:
             left_lanes: List of left lane lines
             right_lanes: List of right lane lines
-            safe_lanes: List of safe lane lines
-            lane_divider_x: X-coordinate of lane divider
+            road_mask: Binary mask of road area
             
         Returns:
-            lane_center_info: Dictionary with enhanced safety information
+            lane_center_info: Dictionary with lane center calculation
         """
         image_center_x = self.image_width // 2
         
-        # Calculate stable positions
-        stable_left_x = self.calculate_stable_lane_position(
-            left_lanes, self.left_lane_history, self.prev_left_lane_x
-        )
-        stable_right_x = self.calculate_stable_lane_position(
-            right_lanes, self.right_lane_history, self.prev_right_lane_x
-        )
+        # Method 1: Use detected lane lines
+        left_x = None
+        right_x = None
         
-        # Initialize enhanced results
-        lane_center_info = {
-            'has_left_lane': stable_left_x is not None,
-            'has_right_lane': stable_right_x is not None,
-            'left_lane_x': stable_left_x,
-            'right_lane_x': stable_right_x,
-            'lane_center_x': None,
-            'steering_error': None,
-            'steering_direction': 'UNKNOWN',
-            'confidence': 'LOW',
-            'safety_status': 'UNKNOWN',
-            'lane_divider_x': lane_divider_x,
-            'sidewalk_detected': self.sidewalk_detected,
-            'illegal_lane_change_risk': False
-        }
+        if left_lanes:
+            # Average all left lane positions at bottom of image
+            left_positions = []
+            for line in left_lanes:
+                x1, y1, x2, y2 = line[0]
+                # Extrapolate to bottom of image
+                if y1 != y2:
+                    bottom_x = x1 + (x2 - x1) * (self.image_height - 80 - y1) / (y2 - y1)
+                    left_positions.append(bottom_x)
+            if left_positions:
+                left_x = np.mean(left_positions)
         
-        # SAFETY ENFORCEMENT: Check for illegal lane change risk
-        if lane_divider_x is not None and self.prev_lane_center_x is not None:
-            # Check if we're getting too close to the divider
-            if abs(self.prev_lane_center_x - lane_divider_x) < 40:
-                lane_center_info['illegal_lane_change_risk'] = True
-                lane_center_info['safety_status'] = 'DANGER'
+        if right_lanes:
+            # Average all right lane positions at bottom of image
+            right_positions = []
+            for line in right_lanes:
+                x1, y1, x2, y2 = line[0]
+                # Extrapolate to bottom of image
+                if y1 != y2:
+                    bottom_x = x1 + (x2 - x1) * (self.image_height - 80 - y1) / (y2 - y1)
+                    right_positions.append(bottom_x)
+            if right_positions:
+                right_x = np.mean(right_positions)
         
-        # Calculate lane center with safety constraints
-        current_center = None
+        # Method 2: Use road mask center if no lanes detected
+        road_center_x = None
+        if left_x is None and right_x is None:
+            # Find the center of the road mask at the bottom
+            bottom_row = road_mask[self.image_height - 100:self.image_height - 80, :]
+            road_pixels = np.where(bottom_row > 0)
+            if len(road_pixels[1]) > 0:
+                road_left = np.min(road_pixels[1])
+                road_right = np.max(road_pixels[1])
+                road_center_x = (road_left + road_right) / 2
         
-        if stable_left_x is not None and stable_right_x is not None:
+        # Calculate lane center
+        lane_center_x = None
+        confidence = 'NONE'
+        
+        if left_x is not None and right_x is not None:
             # Both lanes detected
-            lane_width = abs(stable_right_x - stable_left_x)
-            
-            if 60 <= lane_width <= 180:  # Valid lane width
-                current_center = (stable_left_x + stable_right_x) / 2
-                lane_center_info['confidence'] = 'HIGH'
-                lane_center_info['safety_status'] = 'SAFE'
+            lane_width = abs(right_x - left_x)
+            if self.min_lane_width <= lane_width <= self.max_lane_width:
+                lane_center_x = (left_x + right_x) / 2
+                confidence = 'HIGH'
             else:
-                # Invalid width - use safer single lane approach
+                # Invalid lane width, use single lane approach
                 if self.prev_lane_center_x is not None:
-                    # Stay close to previous position
-                    if abs(stable_left_x - self.prev_lane_center_x) < abs(stable_right_x - self.prev_lane_center_x):
-                        current_center = stable_left_x + 80
+                    if abs(left_x - self.prev_lane_center_x) < abs(right_x - self.prev_lane_center_x):
+                        lane_center_x = left_x + 90  # Assume 180px lane width
                     else:
-                        current_center = stable_right_x - 80
+                        lane_center_x = right_x - 90
                 else:
-                    current_center = image_center_x
-                    
-                lane_center_info['confidence'] = 'MEDIUM'
-                lane_center_info['safety_status'] = 'CAUTION'
-        
-        elif stable_left_x is not None:
-            # Only left lane - be very conservative
-            if self.prev_lane_center_x is not None:
-                estimated_center = stable_left_x + 80
-                # Move only 15% toward estimated center
-                current_center = self.prev_lane_center_x + 0.15 * (estimated_center - self.prev_lane_center_x)
-            else:
-                current_center = stable_left_x + 80
+                    lane_center_x = (left_x + right_x) / 2
+                confidence = 'MEDIUM'
                 
-            lane_center_info['confidence'] = 'LOW'
-            lane_center_info['safety_status'] = 'CAUTION'
-        
-        elif stable_right_x is not None:
-            # Only right lane - be very conservative
-            if self.prev_lane_center_x is not None:
-                estimated_center = stable_right_x - 80
-                # Move only 15% toward estimated center
-                current_center = self.prev_lane_center_x + 0.15 * (estimated_center - self.prev_lane_center_x)
-            else:
-                current_center = stable_right_x - 80
-                
-            lane_center_info['confidence'] = 'LOW'
-            lane_center_info['safety_status'] = 'CAUTION'
-        
+        elif left_x is not None:
+            # Only left lane detected
+            lane_center_x = left_x + 90  # Assume we're 90px from left edge
+            confidence = 'LOW'
+            
+        elif right_x is not None:
+            # Only right lane detected
+            lane_center_x = right_x - 90  # Assume we're 90px from right edge
+            confidence = 'LOW'
+            
+        elif road_center_x is not None:
+            # No lanes, but road detected - follow road center
+            lane_center_x = road_center_x
+            confidence = 'LOW'
+            
         else:
-            # No lanes detected - emergency mode
+            # Nothing detected - use previous position or image center
             if self.prev_lane_center_x is not None:
-                current_center = self.prev_lane_center_x  # Hold position
+                lane_center_x = self.prev_lane_center_x
             else:
-                current_center = image_center_x
-                
-            lane_center_info['confidence'] = 'NONE'
-            lane_center_info['safety_status'] = 'EMERGENCY'
+                lane_center_x = image_center_x
+            confidence = 'NONE'
         
-        # CRITICAL SAFETY ENFORCEMENT
-        if current_center is not None:
+        # Apply temporal smoothing and safety constraints
+        if lane_center_x is not None:
             # Limit sudden changes
             if self.prev_lane_center_x is not None:
-                max_change = 15  # Very conservative change limit
-                if abs(current_center - self.prev_lane_center_x) > max_change:
-                    direction = 1 if current_center > self.prev_lane_center_x else -1
-                    current_center = self.prev_lane_center_x + (direction * max_change)
+                max_change = 30
+                if abs(lane_center_x - self.prev_lane_center_x) > max_change:
+                    direction = 1 if lane_center_x > self.prev_lane_center_x else -1
+                    lane_center_x = self.prev_lane_center_x + (direction * max_change)
             
-            # ABSOLUTE SAFETY BOUNDARIES
-            # These boundaries prevent sidewalk approach and illegal lane changes
-            absolute_left_limit = self.image_width * 0.30   # 30% - strict left boundary
-            absolute_right_limit = self.image_width * 0.70  # 70% - strict right boundary
+            # Keep within safe boundaries (20% to 80% of image width)
+            safe_left = self.image_width * 0.20
+            safe_right = self.image_width * 0.80
+            lane_center_x = np.clip(lane_center_x, safe_left, safe_right)
             
-            # If lane divider detected, enforce additional constraint
-            if lane_divider_x is not None:
-                # Don't go past the divider minus safety margin
-                divider_safety_limit = lane_divider_x + 50  # 50px safety margin
-                if divider_safety_limit > absolute_left_limit:
-                    absolute_left_limit = divider_safety_limit
-            
-            # Apply absolute constraints
-            current_center = np.clip(current_center, absolute_left_limit, absolute_right_limit)
-            
-            # Update history
-            self.lane_center_history.append(current_center)
+            # Add to history for smoothing
+            self.lane_center_history.append(lane_center_x)
             
             # Apply temporal smoothing
             if len(self.lane_center_history) >= 5:
-                weights = np.exp(np.linspace(-1.5, 0, len(self.lane_center_history)))
+                weights = np.exp(np.linspace(-1, 0, len(self.lane_center_history)))
                 weights = weights / np.sum(weights)
-                lane_center_info['lane_center_x'] = np.average(list(self.lane_center_history), weights=weights)
-            else:
-                lane_center_info['lane_center_x'] = current_center
+                lane_center_x = np.average(list(self.lane_center_history), weights=weights)
         
-        # Calculate steering with enhanced safety
-        if lane_center_info['lane_center_x'] is not None:
-            lane_center_info['steering_error'] = lane_center_info['lane_center_x'] - image_center_x
+        # Calculate steering error
+        steering_error = None
+        steering_direction = 'UNKNOWN'
+        
+        if lane_center_x is not None:
+            steering_error = lane_center_x - image_center_x
             
-            # Safety-based dead zones
-            if lane_center_info['safety_status'] == 'DANGER':
-                dead_zone = 50  # Large dead zone in danger
-            elif lane_center_info['safety_status'] == 'EMERGENCY':
-                dead_zone = 60  # Very large dead zone in emergency
-            else:
-                dead_zone = {
-                    'HIGH': 8,
-                    'MEDIUM': 15,
-                    'LOW': 25,
-                    'NONE': 35
-                }.get(lane_center_info['confidence'], 35)
+            # Adaptive dead zone based on confidence
+            dead_zone = {
+                'HIGH': 15,
+                'MEDIUM': 25,
+                'LOW': 35,
+                'NONE': 50
+            }.get(confidence, 50)
             
-            if abs(lane_center_info['steering_error']) < dead_zone:
-                lane_center_info['steering_direction'] = 'STRAIGHT'
-            elif lane_center_info['steering_error'] > 0:
-                lane_center_info['steering_direction'] = 'STEER_LEFT'
+            if abs(steering_error) < dead_zone:
+                steering_direction = 'STRAIGHT'
+            elif steering_error > 0:
+                steering_direction = 'STEER_LEFT'
             else:
-                lane_center_info['steering_direction'] = 'STEER_RIGHT'
+                steering_direction = 'STEER_RIGHT'
         
         # Update memory
-        self.prev_left_lane_x = stable_left_x
-        self.prev_right_lane_x = stable_right_x
-        self.prev_lane_center_x = lane_center_info['lane_center_x']
-        self.prev_lane_divider_x = lane_divider_x
+        self.prev_lane_center_x = lane_center_x
+        self.prev_left_lane_x = left_x
+        self.prev_right_lane_x = right_x
         
-        return lane_center_info
-
+        return {
+            'has_left_lane': left_x is not None,
+            'has_right_lane': right_x is not None,
+            'left_lane_x': left_x,
+            'right_lane_x': right_x,
+            'lane_center_x': lane_center_x,
+            'steering_error': steering_error,
+            'steering_direction': steering_direction,
+            'confidence': confidence,
+            'safety_status': 'SAFE' if confidence in ['HIGH', 'MEDIUM'] else 'CAUTION'
+        }
+    
+    def detect_obstacles_basic(self, image, road_mask):
+        """
+        Basic obstacle detection within the road area.
+        
+        This is a simple implementation - for full functionality,
+        you'd want to use CARLA's LiDAR or depth sensors.
+        
+        Args:
+            image: RGB image
+            road_mask: Binary mask of road area
+            
+        Returns:
+            obstacles: List of detected obstacle bounding boxes
+        """
+        # Convert to HSV for better object detection
+        hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
+        
+        # Detect non-road objects (cars, pedestrians, etc.)
+        # Cars are typically darker than the road
+        car_lower = np.array([0, 0, 0])
+        car_upper = np.array([180, 255, 80])
+        car_mask = cv2.inRange(hsv, car_lower, car_upper)
+        
+        # Only look for obstacles within the road area
+        obstacle_mask = cv2.bitwise_and(car_mask, road_mask)
+        
+        # Find contours (potential obstacles)
+        contours, _ = cv2.findContours(obstacle_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        obstacles = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area > 500:  # Filter small noise
+                x, y, w, h = cv2.boundingRect(contour)
+                # Only consider obstacles in the lower half of the image (closer to vehicle)
+                if y > self.image_height // 2:
+                    obstacles.append((x, y, w, h))
+        
+        return obstacles
+    
     def process_image(self, image):
         """
-        Complete enhanced lane detection pipeline with safety-first approach.
+        Complete robust lane detection pipeline.
         
         Args:
             image: Raw camera image from CARLA
             
         Returns:
-            result_image: Image with comprehensive detection overlay
-            lane_info: Dictionary with enhanced lane detection and safety results
+            result_image: Image with detection overlays
+            lane_info: Dictionary with lane detection results
         """
-        # Step 1: Enhanced preprocessing
-        processed = self.preprocess_image(image)
+        # Step 1: Segment the road area
+        road_mask = self.segment_road(image)
         
-        # Step 2: Apply ROI to different detection targets
-        masked_lane_edges = self.apply_region_of_interest(processed['lane_edges'])
+        # Step 2: Detect lane lines within the road area
+        left_lanes, right_lanes = self.detect_lane_lines_in_road(image, road_mask)
         
-        # Step 3: Detect sidewalks
-        sidewalk_boundaries = self.detect_sidewalks(processed['sidewalk_edges'])
+        # Step 3: Calculate robust lane center
+        lane_center_info = self.calculate_lane_center_robust(left_lanes, right_lanes, road_mask)
         
-        # Step 4: Detect lane dividers
-        lane_divider_x = self.detect_lane_dividers(processed['yellow_mask'])
+        # Step 4: Basic obstacle detection
+        obstacles = self.detect_obstacles_basic(image, road_mask)
         
-        # Step 5: Detect lane lines
-        lines = self.detect_lines(masked_lane_edges)
-        
-        # Step 6: Enhanced lane classification with safety
-        left_lanes, right_lanes, safe_lanes = self.classify_lanes_with_safety(lines, lane_divider_x)
-        
-        # Step 7: Calculate safe lane center
-        lane_center_info = self.calculate_safe_lane_center(left_lanes, right_lanes, safe_lanes, lane_divider_x)
-        
-        # Step 8: Create comprehensive result image
+        # Step 5: Create result image with overlays
         result_image = image.copy()
         
-        # Draw detected lanes
+        # Draw road mask (semi-transparent green overlay)
+        road_overlay = np.zeros_like(image)
+        road_overlay[road_mask > 0] = [0, 255, 0]  # Green for road
+        result_image = cv2.addWeighted(result_image, 0.8, road_overlay, 0.2, 0)
+        
+        # Draw detected lane lines
         for line in left_lanes:
             x1, y1, x2, y2 = line[0]
-            cv2.line(result_image, (x1, y1), (x2, y2), (0, 255, 0), 3)  # Green for left
+            cv2.line(result_image, (x1, y1), (x2, y2), (0, 255, 255), 3)  # Yellow for left
             
         for line in right_lanes:
             x1, y1, x2, y2 = line[0]
-            cv2.line(result_image, (x1, y1), (x2, y2), (0, 0, 255), 3)  # Red for right
-        
-        # Draw sidewalk boundaries
-        for line in sidewalk_boundaries:
-            x1, y1, x2, y2 = line[0]
-            cv2.line(result_image, (x1, y1), (x2, y2), (255, 0, 255), 2)  # Magenta for sidewalks
-        
-        # Draw lane divider
-        if lane_divider_x is not None:
-            cv2.line(result_image, (int(lane_divider_x), 0), (int(lane_divider_x), self.image_height), (0, 255, 255), 3)  # Cyan for divider
+            cv2.line(result_image, (x1, y1), (x2, y2), (255, 0, 255), 3)  # Magenta for right
         
         # Draw lane center
         if lane_center_info['lane_center_x'] is not None:
             center_x = int(lane_center_info['lane_center_x'])
-            color = (0, 255, 0) if lane_center_info['safety_status'] == 'SAFE' else (0, 165, 255)  # Green if safe, orange if not
+            color = (0, 255, 0) if lane_center_info['confidence'] in ['HIGH', 'MEDIUM'] else (0, 165, 255)
             cv2.line(result_image, (center_x, 0), (center_x, self.image_height), color, 2)
             cv2.circle(result_image, (center_x, self.image_height - 50), 8, color, -1)
         
         # Draw vehicle center reference
         cv2.line(result_image, (self.image_width // 2, 0), (self.image_width // 2, self.image_height), (255, 255, 255), 1)
         
-        # Draw enhanced ROI
+        # Draw ROI
         cv2.polylines(result_image, [self.roi_vertices], True, (255, 255, 0), 2)
         
-        # Draw safety boundaries
-        left_boundary = int(self.image_width * 0.30)
-        right_boundary = int(self.image_width * 0.70)
-        cv2.line(result_image, (left_boundary, 0), (left_boundary, self.image_height), (128, 128, 128), 1)
-        cv2.line(result_image, (right_boundary, 0), (right_boundary, self.image_height), (128, 128, 128), 1)
+        # Draw obstacles
+        for (x, y, w, h) in obstacles:
+            cv2.rectangle(result_image, (x, y), (x + w, y + h), (0, 0, 255), 2)
+            cv2.putText(result_image, "OBSTACLE", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
         
-        # Add safety status text
-        safety_text = f"Safety: {lane_center_info['safety_status']}"
-        cv2.putText(result_image, safety_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        # Add status text
+        status_text = f"Confidence: {lane_center_info['confidence']} | Status: {lane_center_info['safety_status']}"
+        cv2.putText(result_image, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
-        if lane_center_info['illegal_lane_change_risk']:
-            cv2.putText(result_image, "ILLEGAL LANE CHANGE RISK!", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        if obstacles:
+            cv2.putText(result_image, f"OBSTACLES DETECTED: {len(obstacles)}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         
-        if self.sidewalk_detected:
-            cv2.putText(result_image, "SIDEWALK DETECTED", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
-        
-        # Prepare comprehensive lane info
+        # Prepare lane info
         lane_info = {
-            'total_lines': len(lines) if lines is not None else 0,
+            'total_lines': len(left_lanes) + len(right_lanes),
             'left_lanes': len(left_lanes),
             'right_lanes': len(right_lanes),
-            'safe_lanes': len(safe_lanes),
-            'sidewalk_boundaries': len(sidewalk_boundaries),
-            'lane_divider_detected': self.lane_divider_detected,
-            'sidewalk_detected': self.sidewalk_detected,
-            'edges_image': processed['combined_edges'],
-            'masked_edges': masked_lane_edges,
+            'obstacles_detected': len(obstacles),
+            'road_area_detected': np.sum(road_mask > 0) > 1000,  # Minimum road area
             'lane_center': lane_center_info
         }
         
