@@ -20,7 +20,7 @@ A Python-based autonomous lane following system using the CARLA simulator.
 
 1. **Clone the repository**:
    ```bash
-   git clone <your-repo-url>
+   git clone https://github.com/charlynazzal/car-stim
    cd autonomous-driving
    ```
 
@@ -62,8 +62,8 @@ A Python-based autonomous lane following system using the CARLA simulator.
 src/
 ├── carla_connector.py    # CARLA connection and sensor management
 ├── main.py              # Main application entry point
-├── lane_detection.py    # Lane detection module (coming soon)
-└── vehicle_control.py   # PID controller (coming soon)
+├── lane_detection.py    # Lane detection module
+└── vehicle_controller.py # PID controller
 ```
 
 ## Development
@@ -74,9 +74,6 @@ The system is designed to work independently of where CARLA is installed. Your P
 - Develop and test your Python code separately
 - Make changes to the scripts and see results immediately
 
-## Next Steps
+## Status
 
-- [ ] Implement lane detection using OpenCV
-- [ ] Add PID controller for steering
-- [ ] Include safety limits and error handling
-- [ ] Add visualization overlays 
+This is a work in progress. The system currently has basic lane detection and vehicle control implemented, but requires further development and testing for reliable operation. 
