@@ -28,10 +28,10 @@ class VehicleController:
         self.max_throttle = 0.7         # Maximum throttle (increased from 0.6)
         self.min_throttle = 0.2         # Minimum throttle to keep moving (increased from 0.1)
         
-        # PID Controller parameters for steering
-        self.kp_steer = 0.005           # Proportional gain for steering (reduced for smoother control)
-        self.ki_steer = 0.0001          # Integral gain for steering (reduced for stability)
-        self.kd_steer = 0.015           # Derivative gain for steering (reduced for less oscillation)
+        # PID Controller parameters for steering - much more conservative
+        self.kp_steer = 0.002           # Proportional gain - reduced further for stability
+        self.ki_steer = 0.00005         # Integral gain - reduced further to prevent windup
+        self.kd_steer = 0.008           # Derivative gain - reduced further for smoothness
         
         # Control history for derivative and integral terms
         self.error_history = deque(maxlen=10)
@@ -71,8 +71,10 @@ class VehicleController:
         # Safety check: clamp steering error to reasonable range
         steering_error = np.clip(steering_error, -400, 400)
         
-        # Use steering error directly (positive error = steer right, negative = steer left)
-        corrected_error = steering_error
+        # Fix steering direction: positive error means lane center is RIGHT of vehicle center
+        # To correct, we need to steer LEFT (negative steering angle)
+        # Therefore: positive error → negative steering correction
+        corrected_error = -steering_error
         
         # Confidence-based gain adjustment
         confidence_multiplier = {
